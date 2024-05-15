@@ -1,0 +1,77 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push Docker image
+        env:
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          docker build -t $ECR_REPOSITORY:latest .
+          $(aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REPOSITORY)
+          docker tag $ECR_REPOSITORY:latest $ECR_REPOSITORY:latest
+          docker push $ECR_REPOSITORY:latest
+
+      - name: Update ECS service
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          ECS_CLUSTER_NAME: ${{ secrets.ECS_CLUSTER_NAME }}
+          ECS_SERVICE_NAME: ${{ secrets.ECS_SERVICE_NAME }}
+          CONTAINER_NAME: ${{ secrets.CONTAINER_NAME }}
+        run: |
+          TASK_DEFINITION=$(aws ecs describe-task-definition --task-definition $ECS_SERVICE_NAME)
+          CONTAINER_DEFINITIONS=$(echo $TASK_DEFINITION | jq --arg IMAGE "$ECR_REPOSITORY:latest" '.taskDefinition.containerDefinitions[0].image = $IMAGE' | jq '.taskDefinition.containerDefinitions')
+          TASK_ROLE_ARN=$(echo $TASK_DEFINITION | jq -r '.taskDefinition.taskRoleArn')
+          EXECUTION_ROLE_ARN=$(echo $TASK_DEFINITION | jq -r '.taskDefinition.executionRoleArn')
+          FAMILY=$(echo $TASK_DEFINITION | jq -r '.taskDefinition.family')
+          NETWORK_MODE=$(echo $TASK_DEFINITION | jq -r '.taskDefinition.networkMode')
+          VOLUMES=$(echo $TASK_DEFINITION | jq '.taskDefinition.volumes')
+          PLACEMENT_CONSTRAINTS=$(echo $TASK_DEFINITION | jq '.taskDefinition.placementConstraints')
+          CPU=$(echo $TASK_DEFINITION | jq -r '.taskDefinition.cpu')
+          MEMORY=$(echo $TASK_DEFINITION | jq -r '.taskDefinition.memory')
+          REQUIRES_COMPATIBILITIES=$(echo $TASK_DEFINITION | jq '.taskDefinition.requiresCompatibilities')
+
+          NEW_TASK_DEF=$(jq -n --argjson containerDefinitions "$CONTAINER_DEFINITIONS" \
+            --arg taskRoleArn "$TASK_ROLE_ARN" \
+            --arg executionRoleArn "$EXECUTION_ROLE_ARN" \
+            --arg family "$FAMILY" \
+            --arg networkMode "$NETWORK_MODE" \
+            --argjson volumes "$VOLUMES" \
+            --argjson placementConstraints "$PLACEMENT_CONSTRAINTS" \
+            --arg cpu "$CPU" \
+            --arg memory "$MEMORY" \
+            --argjson requiresCompatibilities "$REQUIRES_COMPATIBILITIES" \
+            '{
+              "family": $family,
+              "taskRoleArn": $taskRoleArn,
+              "executionRoleArn": $executionRoleArn,
+              "networkMode": $networkMode,
+              "containerDefinitions": $containerDefinitions,
+              "volumes": $volumes,
+              "placementConstraints": $placementConstraints,
+              "cpu": $cpu,
+              "memory": $memory,
+              "requiresCompatibilities": $requiresCompatibilities
+            }')
+
+          NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json "$NEW_TASK_DEF" | jq -r '.taskDefinition.taskDefinitionArn')
+
+          aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $ECS_SERVICE_NAME --task-definition $NEW_TASK_DEF_ARN
